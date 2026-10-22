@@ -1,8 +1,21 @@
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from functools import lru_cache
+from pathlib import Path
+
+ENV_FILES = [
+    Path(__file__).resolve().parent / ".env",
+    Path(__file__).resolve().parent.parent / ".env",
+]
 
 
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=[str(p) for p in ENV_FILES if p.exists()] or ".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+    )
+
     app_name: str = "FileFlow"
     debug: bool = True
 
@@ -19,13 +32,7 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 1440
 
-    class Config:
-        env_file = ".env"
-        case_sensitive = False
-
     def model_post_init(self, __context):
-        # Neon gives postgresql://... ?sslmode=require
-        # asyncpg needs postgresql+asyncpg:// and ssl=require
         url = self.database_url
         if url.startswith("postgresql://"):
             url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
