@@ -82,7 +82,7 @@ class ProcessingResult(Base):
     type = Column(String(64))  # e.g. "resized", "thumbnail", "text", "preview"
     storage_key = Column(String(1024), nullable=False)
     file_name = Column(String(512))
-    metadata = Column(JSON, nullable=True)
+    result_metadata = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     job = relationship("Job", back_populates="results")
