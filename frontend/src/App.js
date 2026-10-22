@@ -2,7 +2,8 @@ import React, { useState, useEffect, useRef } from 'react';
 import { BrowserRouter, Routes, Route, Navigate, Link } from 'react-router-dom';
 import axios from 'axios';
 
-const API = 'http://localhost:8000/api';
+const API = process.env.REACT_APP_API_URL || 'http://localhost:8000/api';
+const WS_BASE = API.replace(/^http/, 'ws').replace(/\/api$/, '');
 
 function App() {
   const [token, setToken] = useState(localStorage.getItem('token'));
@@ -241,7 +242,7 @@ function Jobs({ token, user }) {
   useEffect(() => {
     fetchJobs();
     if (user?.id) {
-      const ws = new WebSocket(`ws://localhost:8000/ws/${user.id}`);
+      const ws = new WebSocket(`${WS_BASE}/ws/${user.id}`);
       ws.onmessage = (event) => {
         const data = JSON.parse(event.data);
         if (data.type === 'job_update') {
