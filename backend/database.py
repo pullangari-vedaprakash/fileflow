@@ -4,7 +4,16 @@ from config import get_settings
 
 settings = get_settings()
 
-engine = create_async_engine(settings.database_url, echo=settings.debug)
+# Neon URLs include sslmode / channel_binding that asyncpg rejects.
+# Strip them and pass SSL through connect_args instead.
+url = settings.database_url
+connect_args = {}
+if "ssl=" in url or "sslmode=" in url or "neon.tech" in url:
+    base, _, query = url.partition("?")
+    url = base
+    connect_args["ssl"] = "require"
+
+engine = create_async_engine(url, echo=settings.debug, connect_args=connect_args)
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 

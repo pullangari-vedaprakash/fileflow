@@ -59,17 +59,19 @@ async def notify_job_update(user_id: int, job_id: int, status: str, progress: fl
     await manager.send_to_user(user_id, payload)
 
 
-# Redis Pub/Sub listener (started from main.py lifespan)
 async def redis_subscriber():
-    r = redis.from_url(settings.redis_url, decode_responses=True)
-    pubsub = r.pubsub()
-    await pubsub.subscribe("job_updates")
-    async for message in pubsub.listen():
-        if message["type"] == "message":
-            try:
-                data = json.loads(message["data"])
-                user_id = data.get("user_id")
-                if user_id:
-                    await manager.send_to_user(user_id, data)
-            except Exception:
-                pass
+    try:
+        r = redis.from_url(settings.redis_url, decode_responses=True)
+        pubsub = r.pubsub()
+        await pubsub.subscribe("job_updates")
+        async for message in pubsub.listen():
+            if message["type"] == "message":
+                try:
+                    data = json.loads(message["data"])
+                    user_id = data.get("user_id")
+                    if user_id:
+                        await manager.send_to_user(user_id, data)
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"Redis subscriber failed: {e}")
