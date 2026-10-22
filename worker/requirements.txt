@@ -1,0 +1,10 @@
+fastapi
+redis
+aioredis
+minio
+pillow
+pymupdf
+sqlalchemy
+asyncpg
+python-dotenv
+httpx

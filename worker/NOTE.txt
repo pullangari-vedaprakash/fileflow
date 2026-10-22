@@ -1,0 +1,2 @@
+# Add this to worker.py top or set PYTHONPATH
+# For local run: PYTHONPATH=../backend python worker.py
