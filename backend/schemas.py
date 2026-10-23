@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, ConfigDict
 from typing import Optional, List
 from datetime import datetime
 
@@ -19,15 +19,14 @@ class Token(BaseModel):
 
 
 class FileOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     original_name: str
-    mime_type: Optional[str]
-    extension: Optional[str]
-    size: Optional[int]
+    mime_type: Optional[str] = None
+    extension: Optional[str] = None
+    size: Optional[int] = None
     created_at: datetime
-
-    class Config:
-        from_attributes = True
 
 
 class JobCreate(BaseModel):
@@ -37,6 +36,8 @@ class JobCreate(BaseModel):
 
 
 class JobOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     file_id: int
     operations: List[str]
@@ -44,22 +45,18 @@ class JobOut(BaseModel):
     status: str
     progress: float
     retry_count: int
-    error_message: Optional[str]
+    error_message: Optional[str] = None
     created_at: datetime
-    started_at: Optional[datetime]
-    completed_at: Optional[datetime]
-
-    class Config:
-        from_attributes = True
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
 
 
 class ResultOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     type: str
-    file_name: Optional[str]
+    file_name: Optional[str] = None
     storage_key: str
     created_at: datetime
     download_url: Optional[str] = None
-
-    class Config:
-        from_attributes = True

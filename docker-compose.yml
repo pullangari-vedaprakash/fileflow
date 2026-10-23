@@ -3,6 +3,7 @@ version: '3.8'
 services:
   postgres:
     image: postgres:16-alpine
+    container_name: fileflow-postgres
     environment:
       POSTGRES_USER: fileflow
       POSTGRES_PASSWORD: fileflow123
@@ -19,6 +20,7 @@ services:
 
   redis:
     image: redis:7-alpine
+    container_name: fileflow-redis
     ports:
       - "6379:6379"
     healthcheck:
@@ -29,6 +31,7 @@ services:
 
   minio:
     image: minio/minio:latest
+    container_name: fileflow-minio
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: minioadmin
@@ -43,6 +46,64 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: fileflow-backend
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://fileflow:fileflow123@postgres:5432/fileflow
+      - REDIS_URL=redis://redis:6379/0
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin123
+      - MINIO_BUCKET=fileflow
+      - MINIO_SECURE=false
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: ./worker/Dockerfile
+    container_name: fileflow-worker
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://fileflow:fileflow123@postgres:5432/fileflow
+      - REDIS_URL=redis://redis:6379/0
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin123
+      - MINIO_BUCKET=fileflow
+      - MINIO_SECURE=false
+    depends_on:
+      backend:
+        condition: service_started
+      redis:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: fileflow-frontend
+    ports:
+      - "3000:80"
+    environment:
+      - REACT_APP_API_URL=http://localhost:8000/api
+    depends_on:
+      - backend
 
 volumes:
   postgres_data:

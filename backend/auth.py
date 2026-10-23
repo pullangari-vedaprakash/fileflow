@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 from jose import JWTError, jwt
 import bcrypt
@@ -11,7 +11,7 @@ from models import User
 from config import get_settings
 
 settings = get_settings()
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login", auto_error=True)
 
 ALGORITHM = settings.jwt_algorithm
 SECRET_KEY = settings.jwt_secret
@@ -19,16 +19,16 @@ ACCESS_TOKEN_EXPIRE_MINUTES = settings.jwt_expire_minutes
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return bcrypt.checkpw(plain_password.encode(), hashed_password.encode())
+    return bcrypt.checkpw(plain_password.encode("utf-8"), hashed_password.encode("utf-8"))
 
 
 def get_password_hash(password: str) -> str:
-    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    expire = datetime.now(timezone.utc) + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
@@ -50,7 +50,12 @@ async def get_current_user(
     except JWTError:
         raise credentials_exception
 
-    result = await db.execute(select(User).where(User.id == int(user_id)))
+    try:
+        uid = int(user_id)
+    except (ValueError, TypeError):
+        raise credentials_exception
+
+    result = await db.execute(select(User).where(User.id == uid))
     user = result.scalar_one_or_none()
     if user is None:
         raise credentials_exception

@@ -1,167 +1,231 @@
+import os
+import sys
 import asyncio
 import json
 import uuid
-from datetime import datetime, timedelta
+import logging
+from datetime import datetime, timezone
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
-from sqlalchemy import select, update
+from sqlalchemy import select, update, delete
 import redis.asyncio as redis
+
+# Ensure backend modules (config, models, database, storage) are resolvable
+current_dir = os.path.dirname(os.path.abspath(__file__))
+backend_dir = os.path.abspath(os.path.join(current_dir, "..", "backend"))
+for d in (backend_dir, current_dir):
+    if d not in sys.path:
+        sys.path.insert(0, d)
+
 from config import get_settings
-from models import Job, File, ProcessingResult, Worker, JobStatus
+from models import Job, File, ProcessingResult, JobStatus
 from storage import storage
+from scheduler import QueueScheduler
+from heartbeat import HeartbeatService
+from recovery import RecoveryService
 from processors.image_processor import ImageProcessor
 from processors.pdf_processor import PDFProcessor
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
+)
+logger = logging.getLogger("worker")
+
 settings = get_settings()
 
-engine = create_async_engine(settings.database_url)
+# Setup async SQLAlchemy engine
+engine_url = settings.database_url
+connect_args = {}
+if "ssl=" in engine_url or "sslmode=" in engine_url or "neon.tech" in engine_url:
+    base, _, _ = engine_url.partition("?")
+    engine_url = base
+    connect_args["ssl"] = "require"
+
+engine = create_async_engine(engine_url, echo=False, connect_args=connect_args)
 async_session = async_sessionmaker(engine, expire_on_commit=False)
 
 redis_client = redis.from_url(settings.redis_url, decode_responses=True)
 
-WORKER_ID = str(uuid.uuid4())[:8]
-PRIORITY_SCORES = {"HIGH": 100, "NORMAL": 50, "LOW": 10}
+WORKER_ID = f"worker-{uuid.uuid4().hex[:8]}"
 
 
-async def publish_update(user_id: int, job_id: int, status: str, progress: float = None, error: str = None):
+async def publish_progress(user_id: int, job_id: int, status: str, progress: float = None, error: str = None):
     payload = {
-        "user_id": user_id,
         "type": "job_update",
         "job_id": job_id,
+        "user_id": user_id,
         "status": status,
         "progress": progress,
         "error": error,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
-    await redis_client.publish("job_updates", json.dumps(payload))
+    try:
+        await redis_client.publish("job_updates", json.dumps(payload))
+    except Exception as e:
+        logger.warning(f"Failed to publish progress to Redis Pub/Sub: {e}")
 
 
-class JobWorker:
-    def __init__(self):
-        self.running = True
-        self.current_job_id = None
+class FileFlowWorker:
+    def __init__(self, worker_id: str = WORKER_ID):
+        self.worker_id = worker_id
+        self.running = False
+        self.scheduler = QueueScheduler(redis_client)
+        self.heartbeat = HeartbeatService(self.worker_id, async_session, interval_seconds=10)
+        self.recovery = RecoveryService(
+            self.worker_id,
+            async_session,
+            redis_client,
+            self.scheduler,
+            interval_seconds=30,
+        )
 
-    async def heartbeat(self):
-        while self.running:
-            async with async_session() as db:
-                stmt = update(Worker).where(Worker.id == WORKER_ID).values(
-                    last_heartbeat=datetime.utcnow(),
-                    status="BUSY" if self.current_job_id else "IDLE",
-                    current_job_id=self.current_job_id,
-                )
-                result = await db.execute(stmt)
-                if result.rowcount == 0:
-                    db.add(Worker(
-                        id=WORKER_ID,
-                        status="BUSY" if self.current_job_id else "IDLE",
-                        current_job_id=self.current_job_id,
-                        last_heartbeat=datetime.utcnow(),
-                    ))
-                await db.commit()
-            await asyncio.sleep(10)
+    def get_processor_for_file(self, extension: str):
+        ext = (extension or "").lower()
+        if ext in {".jpg", ".jpeg", ".png", ".webp"}:
+            return ImageProcessor()
+        elif ext == ".pdf":
+            return PDFProcessor()
+        return None
 
-    async def recover_stale_jobs(self):
-        while self.running:
-            async with async_session() as db:
-                stale_threshold = datetime.utcnow() - timedelta(seconds=60)
-                result = await db.execute(
-                    select(Worker).where(Worker.last_heartbeat < stale_threshold, Worker.status == "BUSY")
-                )
-                stale_workers = result.scalars().all()
-                for w in stale_workers:
-                    if w.current_job_id:
-                        job_result = await db.execute(select(Job).where(Job.id == w.current_job_id))
-                        job = job_result.scalar_one_or_none()
-                        if job and job.status == JobStatus.PROCESSING.value:
-                            job.status = JobStatus.QUEUED.value
-                            job.error_message = "Worker died, requeued"
-                            await db.commit()
-                            # Re-add to sorted set with fresh score
-                            created_ts = datetime.utcnow().timestamp()
-                            score = PRIORITY_SCORES.get(job.priority, 50) + (created_ts / 1000.0)
-                            await redis_client.zadd("job_queue", {str(job.id): score})
-                        w.status = "DEAD"
-                        await db.commit()
-            await asyncio.sleep(30)
-
-    async def process_job(self, job_id: int):
+    async def claim_job_atomically(self, job_id: int) -> bool:
+        """
+        Idempotent atomic job claiming:
+        Transitions QUEUED -> PROCESSING in PostgreSQL using UPDATE ... WHERE status='QUEUED'.
+        Returns True only if THIS worker successfully transitioned the job.
+        Guarantees duplicate delivery does not result in concurrent duplicate execution.
+        """
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         async with async_session() as db:
-            result = await db.execute(select(Job).where(Job.id == job_id))
-            job = result.scalar_one_or_none()
-            if not job or job.status != JobStatus.QUEUED.value:
+            stmt = (
+                update(Job)
+                .where(Job.id == job_id, Job.status == JobStatus.QUEUED.value)
+                .values(
+                    status=JobStatus.PROCESSING.value,
+                    started_at=now,
+                    progress=0.0,
+                )
+            )
+            result = await db.execute(stmt)
+            await db.commit()
+            return result.rowcount > 0
+
+    async def process_single_job(self, job_id: int):
+        # 1. Atomic claim check
+        claimed = await self.claim_job_atomically(job_id)
+        if not claimed:
+            logger.info(f"Job {job_id} already claimed or cancelled. Skipping.")
+            return
+
+        self.heartbeat.set_current_job(job_id)
+        logger.info(f"EVENT=JOB_CLAIMED worker_id={self.worker_id} job_id={job_id}")
+
+        async with async_session() as db:
+            job_res = await db.execute(select(Job).where(Job.id == job_id))
+            job = job_res.scalar_one_or_none()
+            if not job:
+                logger.error(f"Job {job_id} not found after claiming.")
+                self.heartbeat.set_current_job(None)
                 return
 
-            job.status = JobStatus.PROCESSING.value
-            job.started_at = datetime.utcnow()
-            job.progress = 0.0
-            await db.commit()
-            self.current_job_id = job_id
-
-            await publish_update(job.user_id, job.id, "PROCESSING", 0.0)
+            user_id = job.user_id
+            await publish_progress(user_id, job_id, "PROCESSING", 0.0)
 
             try:
-                file_result = await db.execute(select(File).where(File.id == job.file_id))
-                file = file_result.scalar_one()
-                file_bytes = storage.download_file(file.storage_key)
+                # 2. Fetch input file metadata
+                file_res = await db.execute(select(File).where(File.id == job.file_id))
+                file_obj = file_res.scalar_one_or_none()
+                if not file_obj:
+                    raise ValueError(f"Associated file ID {job.file_id} not found")
 
-                processor = None
-                if file.extension in [".jpg", ".jpeg", ".png", ".webp"]:
-                    processor = ImageProcessor()
-                elif file.extension == ".pdf":
-                    processor = PDFProcessor()
+                logger.info(f"EVENT=JOB_STARTED job_id={job_id} file='{file_obj.original_name}' ops={job.operations}")
 
+                # 3. Download binary from object storage
+                file_bytes = storage.download_file(file_obj.storage_key)
+
+                # 4. Select modular processor
+                processor = self.get_processor_for_file(file_obj.extension)
                 if not processor:
-                    raise ValueError("Unsupported file type")
+                    raise ValueError(f"No processor registered for extension '{file_obj.extension}'")
 
-                # Process with progress
-                async def progress_cb(p):
-                    job.progress = p
+                # Progress callback updater
+                async def progress_cb(pct: float):
+                    job.progress = pct
                     await db.commit()
-                    await publish_update(job.user_id, job.id, "PROCESSING", p)
+                    await publish_progress(user_id, job_id, "PROCESSING", pct)
+                    logger.debug(f"EVENT=JOB_PROGRESS job_id={job_id} progress={pct}%")
 
+                # 5. Clean up any previous results from failed retries (Idempotency)
+                await db.execute(delete(ProcessingResult).where(ProcessingResult.job_id == job_id))
+                await db.commit()
+
+                # 6. Execute processing
                 results = await processor.process(file_bytes, job.operations, job_id, db, progress_cb)
-                for res in results:
-                    db.add(res)
 
+                for r in results:
+                    db.add(r)
+
+                now = datetime.now(timezone.utc).replace(tzinfo=None)
                 job.status = JobStatus.COMPLETED.value
                 job.progress = 100.0
-                job.completed_at = datetime.utcnow()
+                job.completed_at = now
+                job.error_message = None
                 await db.commit()
 
-                await publish_update(job.user_id, job.id, "COMPLETED", 100.0)
-                print(f"Job {job_id} completed")
+                await publish_progress(user_id, job_id, "COMPLETED", 100.0)
+                logger.info(f"EVENT=JOB_COMPLETED worker_id={self.worker_id} job_id={job_id} results_count={len(results)}")
 
             except Exception as e:
-                job.retry_count += 1
+                logger.error(f"EVENT=JOB_ERROR worker_id={self.worker_id} job_id={job_id} error={e}")
                 job.error_message = str(e)
+                job.retry_count += 1
+
                 if job.retry_count >= job.max_retries:
                     job.status = JobStatus.FAILED.value
-                    await publish_update(job.user_id, job.id, "FAILED", job.progress, str(e))
+                    await db.commit()
+                    await publish_progress(user_id, job_id, "FAILED", job.progress, str(e))
+                    logger.error(f"EVENT=JOB_FAILED job_id={job_id} max_retries={job.max_retries} reached.")
                 else:
+                    # Automatic retry: requeue with original creation timestamp
                     job.status = JobStatus.QUEUED.value
-                    created_ts = datetime.utcnow().timestamp()
-                    score = PRIORITY_SCORES.get(job.priority, 50) + (created_ts / 1000.0)
-                    await redis_client.zadd("job_queue", {str(job.id): score})
-                    await publish_update(job.user_id, job.id, "QUEUED", 0.0, f"Retry {job.retry_count}")
-                await db.commit()
-                print(f"Job {job_id} failed: {e}")
+                    job.progress = 0.0
+                    await db.commit()
+                    await self.scheduler.enqueue(job.id, job.priority, job.created_at)
+                    await publish_progress(user_id, job_id, "QUEUED", 0.0, f"Auto-retry {job.retry_count}/{job.max_retries}")
+                    logger.warning(f"EVENT=JOB_RETRIED job_id={job_id} retry_count={job.retry_count}")
+
             finally:
-                self.current_job_id = None
+                self.heartbeat.set_current_job(None)
 
     async def run(self):
-        asyncio.create_task(self.heartbeat())
-        asyncio.create_task(self.recover_stale_jobs())
+        self.running = True
+        logger.info(f"Worker {self.worker_id} online. Priority aging active.")
 
-        print(f"Worker {WORKER_ID} started (priority + aging via sorted set)")
-        while self.running:
-            # ZPOPMAX gets the highest score (highest priority + oldest)
-            result = await redis_client.zpopmax("job_queue", count=1)
-            if result:
-                job_id_str, score = result[0]
-                job_id = int(job_id_str)
-                await self.process_job(job_id)
-            else:
-                await asyncio.sleep(1)
+        # Launch heartbeat & stale recovery background tasks
+        heartbeat_task = asyncio.create_task(self.heartbeat.run())
+        recovery_task = asyncio.create_task(self.recovery.run())
+
+        try:
+            while self.running:
+                # Atomically dequeue next highest priority/aged job
+                item = await self.scheduler.dequeue()
+                if item:
+                    job_id, score = item
+                    logger.info(f"Dequeued job {job_id} (ranking_score={score:.2f})")
+                    await self.process_single_job(job_id)
+                else:
+                    await asyncio.sleep(0.5)
+        except asyncio.CancelledError:
+            logger.info("Worker run loop cancelled.")
+        finally:
+            await self.heartbeat.stop()
+            await self.recovery.stop()
+            heartbeat_task.cancel()
+            recovery_task.cancel()
 
 
 if __name__ == "__main__":
-    worker = JobWorker()
-    asyncio.run(worker.run())
+    worker_instance = FileFlowWorker()
+    try:
+        asyncio.run(worker_instance.run())
+    except KeyboardInterrupt:
+        logger.info("Worker stopped by user.")

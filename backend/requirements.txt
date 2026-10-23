@@ -7,9 +7,9 @@ pydantic[email]
 pydantic-settings
 python-jose[cryptography]
 passlib[bcrypt]
+bcrypt
 python-multipart
 redis
-aioredis
 minio
 pillow
 pymupdf
@@ -18,3 +18,5 @@ python-dotenv
 httpx
 greenlet
 email-validator
+pytest
+pytest-asyncio

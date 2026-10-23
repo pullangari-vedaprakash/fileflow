@@ -1,5 +1,6 @@
 import io
-from typing import BinaryIO
+from typing import BinaryIO, Union
+from datetime import timedelta
 from minio import Minio
 from minio.error import S3Error
 from config import get_settings
@@ -16,7 +17,6 @@ class FileStorage:
             secure=settings.minio_secure,
         )
         self.bucket = settings.minio_bucket
-        # R2 buckets are created in the dashboard; do not try to create them here
 
     def upload_file(self, storage_key: str, data: BinaryIO, length: int, content_type: str = "application/octet-stream"):
         self.client.put_object(
@@ -34,8 +34,9 @@ class FileStorage:
         response.release_conn()
         return data
 
-    def get_presigned_url(self, storage_key: str, expires: int = 3600) -> str:
-        return self.client.presigned_get_object(self.bucket, storage_key, expires=expires)
+    def get_presigned_url(self, storage_key: str, expires: Union[int, timedelta] = 3600) -> str:
+        delta = expires if isinstance(expires, timedelta) else timedelta(seconds=expires)
+        return self.client.presigned_get_object(self.bucket, storage_key, expires=delta)
 
     def delete_file(self, storage_key: str):
         try:
